@@ -134,7 +134,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prompt",
         type=str,
-        default="Give me a short introduction to large language model.",
+        default="Write a detailed technical explanation of how transformer-based large language models generate text step by step. Start from the input tokenization process, then explain how embeddings are computed and combined with positional encodings. Describe the multi-head self-attention mechanism in detail, including how queries, keys, and values are computed and how the attention scores are normalized using softmax. Explain the role of feed-forward networks, layer normalization, and residual connections in each transformer block. Discuss how the final layer produces logits and how sampling methods like temperature scaling, top-k, and top-p affect the output. Compare greedy decoding with stochastic sampling. Also cover the inference optimizations such as KV caching, continuous batching, and speculative decoding. Finally, mention common challenges like repetition, hallucination, and context length limitations, and how techniques like repetition penalty, guided decoding, and RoPE scaling address them. Use concrete examples and be precise but accessible to an intermediate machine learning practitioner.",
         help="Custom prompt text to generate from.",
     )
 
@@ -208,40 +208,45 @@ if __name__ == "__main__":
     tokens = torch.full((total_num_requests, args.max_seq_length), 0, dtype=torch.long, device="cuda")
 
     prompt = args.prompt
-    # This prompt is copied from https://github.com/apoorvumang/prompt-lookup-decoding/blob/main/demo-pld.ipynb
-    code_text = """import numpy as np
-                import matplotlib.pyplot as plt
+    prompt_lengths = torch.zeros(total_num_requests, dtype=torch.int, device="cuda")
 
-                # Calculate the average
-                average_throughput = np.mean(tokens_per_sec_arr)
-                print(f"Average Throughput: {average_throughput} tokens/sec")
+    if args.use_mirage and total_num_requests > 1:
+        prompts = [
+            "What is the capital of France?",
+            "Explain quantum computing in simple terms.",
+            "Write a haiku about artificial intelligence.",
+            "Tell me a fun fact about the Moon."
+        ]
+        # 确保 prompts 数量不少于 total_num_requests，不足则重复最后一个
+        while len(prompts) < total_num_requests:
+            prompts.append(prompts[-1])
+        prompts = prompts[:total_num_requests]
 
-                # Plotting the histogram
-                plt.hist(tokens_per_sec_arr, bins=20, color='blue', edgecolor='black', alpha=0.7)
-                plt.title('Histogram of Throughput Values')
-                plt.xlabel('Tokens per Second')
-                plt.ylabel('Frequency')
-                plt.axvline(average_throughput, color='red', linestyle='dashed', linewidth=1)
-                plt.text(average_throughput*0.9, max(plt.ylim())*0.9, f'Average: {average_throughput:.2f}', color = 'red')
-                plt.show()
-                """
-    #question = "Can you please change x axis to start from 0"
-    #prompt = code_text + "\n" + question
-    messages = [
-        {
-            "role": "system",
-            "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
-        },
-        {"role": "user", "content": prompt},
-    ]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    for r in range(total_num_requests):
-        for i in range(model_inputs.input_ids.shape[-1]):
-            tokens[r, i] = model_inputs.input_ids[0, i]
-    prompt_lengths = torch.full((total_num_requests,), model_inputs.input_ids.shape[-1], dtype=torch.int, device="cuda")
+        for r, prompt in enumerate(prompts):
+            messages = [
+                {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ]
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            input_ids = model_inputs.input_ids[0]          # 1D tensor
+            prompt_len = input_ids.shape[0]
+            prompt_lengths[r] = prompt_len
+            tokens[r, :prompt_len] = input_ids
+    else:
+        # ========== 单请求模式（原有逻辑，保持兼容） ==========
+        prompt = args.prompt
+        messages = [
+            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        
+        for r in range(total_num_requests):
+            for i in range(model_inputs.input_ids.shape[-1]):
+                tokens[r, i] = model_inputs.input_ids[0, i]
+        prompt_lengths = torch.full((total_num_requests,), model_inputs.input_ids.shape[-1], dtype=torch.int, device="cuda")
     positions = torch.arange(32768).unsqueeze(0).to(model.device)
     position_embeddings = model.model.rotary_emb(positions)
 
@@ -833,10 +838,14 @@ if __name__ == "__main__":
         if total_num_requests > 1:
             print(f"Output length of each batch is same: {(step.max() == step.min()).item()}")
 
-        print("Prompt length {}, generate length {}, per-token latency (both prefill and decode): {:.3f} ms".format(
-              prompt_lengths[0], step.max().item() + 1 - prompt_lengths[0], run_time / (step.max().item() + 1)
-            )
-        )
+                # 打印每个请求的统计信息
+        total_tokens = step.max().item() + 1  # 所有请求中最长的序列长度
+        for r in range(total_num_requests):
+            prompt_len = prompt_lengths[r].item()
+            generate_len = step[r].item() + 1 - prompt_len
+            print("Prompt length {}, generate length {}, per-token latency (both prefill and decode): {:.3f} ms".format(
+                prompt_len, generate_len, run_time / total_tokens
+            ))
 
         # -------- CI dumps outputs to json files ----------
         if save_path and rank == 0:
