@@ -134,7 +134,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prompt",
         type=str,
-        default="Give me a short introduction to large language model.",
+        default="hi"*35,
         help="Custom prompt text to generate from.",
     )
 
@@ -208,40 +208,46 @@ if __name__ == "__main__":
     tokens = torch.full((total_num_requests, args.max_seq_length), 0, dtype=torch.long, device="cuda")
 
     prompt = args.prompt
-    # This prompt is copied from https://github.com/apoorvumang/prompt-lookup-decoding/blob/main/demo-pld.ipynb
-    code_text = """import numpy as np
-                import matplotlib.pyplot as plt
+    prompt_lengths = torch.zeros(total_num_requests, dtype=torch.int, device="cuda")
 
-                # Calculate the average
-                average_throughput = np.mean(tokens_per_sec_arr)
-                print(f"Average Throughput: {average_throughput} tokens/sec")
+    if args.use_mirage and total_num_requests > 1:
+        inlen=35
+        prompts = [
+            "hi"*inlen,
+            "hello"*inlen,
+            "oh"*inlen,
+            "only"*inlen
+        ]
+        # 确保 prompts 数量不少于 total_num_requests，不足则重复最后一个
+        while len(prompts) < total_num_requests:
+            prompts.append(prompts[-1])
+        prompts = prompts[:total_num_requests]
 
-                # Plotting the histogram
-                plt.hist(tokens_per_sec_arr, bins=20, color='blue', edgecolor='black', alpha=0.7)
-                plt.title('Histogram of Throughput Values')
-                plt.xlabel('Tokens per Second')
-                plt.ylabel('Frequency')
-                plt.axvline(average_throughput, color='red', linestyle='dashed', linewidth=1)
-                plt.text(average_throughput*0.9, max(plt.ylim())*0.9, f'Average: {average_throughput:.2f}', color = 'red')
-                plt.show()
-                """
-    #question = "Can you please change x axis to start from 0"
-    #prompt = code_text + "\n" + question
-    messages = [
-        {
-            "role": "system",
-            "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
-        },
-        {"role": "user", "content": prompt},
-    ]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    for r in range(total_num_requests):
-        for i in range(model_inputs.input_ids.shape[-1]):
-            tokens[r, i] = model_inputs.input_ids[0, i]
-    prompt_lengths = torch.full((total_num_requests,), model_inputs.input_ids.shape[-1], dtype=torch.int, device="cuda")
+        for r, prompt in enumerate(prompts):
+            messages = [
+                {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ]
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            input_ids = model_inputs.input_ids[0]          # 1D tensor
+            prompt_len = input_ids.shape[0]
+            prompt_lengths[r] = prompt_len
+            tokens[r, :prompt_len] = input_ids
+    else:
+        # ========== 单请求模式（原有逻辑，保持兼容） ==========
+        prompt = args.prompt
+        messages = [
+            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        
+        for r in range(total_num_requests):
+            for i in range(model_inputs.input_ids.shape[-1]):
+                tokens[r, i] = model_inputs.input_ids[0, i]
+        prompt_lengths = torch.full((total_num_requests,), model_inputs.input_ids.shape[-1], dtype=torch.int, device="cuda")
     positions = torch.arange(32768).unsqueeze(0).to(model.device)
     position_embeddings = model.model.rotary_emb(positions)
 
@@ -304,6 +310,12 @@ if __name__ == "__main__":
             args.max_num_pages, dtype=torch.int32, device="cuda")
         paged_kv_last_page_len_buffer = torch.empty(
             args.max_num_batched_requests, dtype=torch.int32, device="cuda")
+        request_start_cycles = torch.zeros(total_num_requests, dtype=torch.uint64, device='cuda')
+        first_token_cycles   = torch.zeros(total_num_requests, dtype=torch.uint64, device='cuda')
+        # token_cycles 需要存储每个请求每个位置的周期数，展平为一维
+        token_cycles = torch.zeros(total_num_requests * args.max_seq_length, dtype=torch.uint64, device='cuda')
+        clock_rate_mhz = torch.cuda.clock_rate(device=0)
+        gpu_clock_khz= clock_rate_mhz * 1000
         mpk = mi.PersistentKernel(
             mode="offline",
             world_size=world_size,
@@ -328,6 +340,10 @@ if __name__ == "__main__":
                 "paged_kv_indptr_buffer": paged_kv_indptr_buffer,
                 "paged_kv_indices_buffer": paged_kv_indices_buffer,
                 "paged_kv_last_page_len_buffer": paged_kv_last_page_len_buffer,
+                "request_start_cycles": request_start_cycles,
+                "first_token_cycles": first_token_cycles,
+                "token_cycles": token_cycles,
+                "gpu_clock_khz": torch.tensor(gpu_clock_khz, dtype=torch.uint64, device='cuda'),
             },
             profiler_tensor=profiler_tensor,
             trace_name=args.trace_name,
@@ -753,6 +769,7 @@ if __name__ == "__main__":
             f.write(results["cuda_code"])
 
         mpk.compile(output_dir=args.output_dir)
+        
 
     # g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
@@ -833,10 +850,34 @@ if __name__ == "__main__":
         if total_num_requests > 1:
             print(f"Output length of each batch is same: {(step.max() == step.min()).item()}")
 
-        print("Prompt length {}, generate length {}, per-token latency (both prefill and decode): {:.3f} ms".format(
-              prompt_lengths[0], step.max().item() + 1 - prompt_lengths[0], run_time / (step.max().item() + 1)
-            )
-        )
+                # 打印每个请求的统计信息
+        total_tokens = step.max().item() + 1  # 所有请求中最长的序列长度
+        request_start_cpu = request_start_cycles.cpu().numpy()
+        first_token_cpu   = first_token_cycles.cpu().numpy()
+        token_cpu         = token_cycles.cpu().numpy().reshape(total_num_requests, args.max_seq_length)
+
+        # 获取时钟频率（从 C++ 端可导出，或直接在 Python 中获取）
+        clock_rate_mhz = torch.cuda.clock_rate(device=0)
+        clock_khz= clock_rate_mhz * 1000
+        print(f"clock_rate={clock_khz}")
+        cycles_to_ms = 1.0 / (clock_khz * 1000.0)  
+        for r in range(total_num_requests):
+            prompt_len = prompt_lengths[r].item()
+            end_pos = step[r].item()   # step 是最后生成的位置
+            if end_pos >= prompt_len:
+                ttft_cycles = first_token_cpu[r] - request_start_cpu[r]
+                print(f"first_token_cpu{first_token_cpu[r]},request_start_cpu{request_start_cpu[r]}")
+                ttft_ms = ttft_cycles * cycles_to_ms
+                print(f"Request {r}: TTFT = {ttft_ms:.3f} ms")
+                
+                # 计算 TBT
+                decode_positions = list(range(prompt_len+1, end_pos+1))
+                if len(decode_positions) >= 2:
+                    tbt_cycles = [token_cpu[r, curr] - token_cpu[r, prev] 
+                                for prev, curr in zip(decode_positions[:-1], decode_positions[1:])]
+                    tbt_ms = [c * cycles_to_ms for c in tbt_cycles]
+                    avg_tbt_ms = sum(tbt_ms) / len(tbt_ms)
+                    print(f"Request {r}: Avg TBT = {avg_tbt_ms:.3f} ms")
 
         # -------- CI dumps outputs to json files ----------
         if save_path and rank == 0:
@@ -861,3 +902,4 @@ if __name__ == "__main__":
 
     if world_size > 1:
         dist.destroy_process_group()
+    

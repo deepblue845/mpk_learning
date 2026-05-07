@@ -21,6 +21,7 @@ HARD_CODE = """
 #include <Python.h>
 #include <cuda_runtime.h>
 
+
 static PyObject *init_func(PyObject *self, PyObject *args) {
   PyObject *meta_list, *py_profiler_buffer;
   std::vector<void*> meta_tensors;
@@ -1747,6 +1748,9 @@ class PersistentKernel:
         meta_tensors.append(self.meta_tensors["paged_kv_indptr_buffer"])
         meta_tensors.append(self.meta_tensors["paged_kv_indices_buffer"])
         meta_tensors.append(self.meta_tensors["paged_kv_last_page_len_buffer"])
+        meta_tensors.append(self.meta_tensors["request_start_cycles"])
+        meta_tensors.append(self.meta_tensors["first_token_cycles"])
+        meta_tensors.append(self.meta_tensors["token_cycles"])
         meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
         profiler_buffer_ptr = (
             self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
@@ -1764,6 +1768,18 @@ class PersistentKernel:
             self.eos_token_id,
             self.allocate_nvshmem_teams,
         )
+        if hasattr(mod, "get_timing_buffer_ptrs"):
+            self.get_timing_buffer_ptrs = getattr(mod, "get_timing_buffer_ptrs")
+            # 调用它获取指针
+            ptrs = (c_uint64 * 4)()  # 或者使用 PyCapsule 更安全
+            self.get_timing_buffer_ptrs(
+                ctypes.byref(ptrs[0]), ctypes.byref(ptrs[1]),
+                ctypes.byref(ptrs[2]), ctypes.byref(ptrs[3])
+            )
+            self.request_start_cycles_ptr = ptrs[0]
+            self.first_token_cycles_ptr   = ptrs[1]
+            self.token_cycles_ptr         = ptrs[2]
+            self.gpu_clock_khz            = ptrs[3]
 
         self._is_compiled = True
 

@@ -211,6 +211,18 @@ __device__ __forceinline__ bool
         }
       }
       config.step[request_id] = step + num_tokens;
+      uint64_t now = clock64();
+      int prompt_lenth = config.prompt_length[request_id];
+      for (int j = 0; j < num_tokens; j++) {
+          int token_pos = step + j + 1;  // 新 token 的位置
+          config.token_cycles[request_id * MPK_MAX_SEQ_LENGTH + token_pos] = now;
+          printf("modify token_cycles%d,%d\n",request_id * MPK_MAX_SEQ_LENGTH + token_pos,now);
+          // 记录 first token (第一个 decode token)
+          if (step < prompt_lenth && token_pos >= prompt_len) {
+              config.first_token_cycles[request_id] = now;
+              printf("modify first_token_cycles%d,%d\n",request_id,now);
+          }
+      }
 #ifdef MPK_ENABLE_PROFILING
       if (true)
 #else
@@ -294,6 +306,11 @@ __device__ __forceinline__ bool
       break;
     }
     config.request_ids[num_reqs] = next_request_id;
+    if (threadIdx.x == 0) {
+        config.request_start_cycles[next_request_id] = clock64();
+
+        printf("modify request_start_cycles%d\n",next_request_id);
+    }
     config.qo_indptr_buffer[num_reqs] = num_tokens;
     config.paged_kv_indptr_buffer[num_reqs] = num_pages;
     // Prefill request
@@ -1096,7 +1113,8 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                                        int total_num_requests,
                                        long long eos_token_id,
                                        int allocate_nvshmem_teams) {
-  assert(meta_tensors.size() == 10);
+  assert(meta_tensors.size() == 13);
+  printf("metatensors accepted\n");
   global_runtime_config.step = static_cast<int *>(meta_tensors[0]);
   global_runtime_config.tokens = static_cast<long long *>(meta_tensors[1]);
   global_runtime_config.input_tokens =
@@ -1302,7 +1320,16 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                first_tasks.size() * sizeof(TaskId),
                cudaMemcpyHostToDevice);
   }
+  global_runtime_config.request_start_cycles =
+      gpu_malloc<uint64_t>(total_num_requests * sizeof(uint64_t));
+  global_runtime_config.first_token_cycles =
+      gpu_malloc<uint64_t>(total_num_requests * sizeof(uint64_t));
+  global_runtime_config.token_cycles =
+      gpu_malloc<uint64_t>(total_num_requests * MPK_MAX_SEQ_LENGTH * sizeof(uint64_t));
 
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, my_rank);
+  global_runtime_config.gpu_clock_khz = prop.clockRate;
   // Set configuration for kernels
   cudaFuncSetAttribute(worker_kernel,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1463,4 +1490,15 @@ extern "C" void finalize_persistent_kernel() {
   cudaEventDestroy(global_runtime_config.scheduler_done_event);
   cudaStreamDestroy(global_runtime_config.worker_stream);
   cudaStreamDestroy(global_runtime_config.scheduler_stream);
+}
+extern "C" {
+    void get_timing_buffer_ptrs(uint64_t** request_start_cycles,
+                                uint64_t** first_token_cycles,
+                                uint64_t** token_cycles,
+                                uint64_t*  gpu_clock_khz) {
+        *request_start_cycles = global_runtime_config.request_start_cycles;
+        *first_token_cycles   = global_runtime_config.first_token_cycles;
+        *token_cycles         = global_runtime_config.token_cycles;
+        *gpu_clock_khz        = global_runtime_config.gpu_clock_khz;
+    }
 }

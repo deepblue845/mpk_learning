@@ -312,6 +312,10 @@ struct RuntimeConfig {
 #ifdef USE_NVSHMEM
   nvshmem_team_t *nvshmem_teams;
 #endif
+  uint64_t* request_start_cycles;   // [total_num_requests]
+  uint64_t* first_token_cycles;     // [total_num_requests]
+  uint64_t* token_cycles;           // [total_num_requests * max_seq_length]
+  uint64_t gpu_clock_khz;           // GPU 时钟频率 (kHz)
 };
 
 } // namespace runtime
