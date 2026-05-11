@@ -216,11 +216,9 @@ __device__ __forceinline__ bool
       for (int j = 0; j < num_tokens; j++) {
           int token_pos = step + j + 1;  // 新 token 的位置
           config.token_cycles[request_id * MPK_MAX_SEQ_LENGTH + token_pos] = now;
-          printf("modify token_cycles%d,%d\n",request_id * MPK_MAX_SEQ_LENGTH + token_pos,now);
           // 记录 first token (第一个 decode token)
           if (step < prompt_lenth && token_pos >= prompt_len) {
               config.first_token_cycles[request_id] = now;
-              printf("modify first_token_cycles%d,%d\n",request_id,now);
           }
       }
 #ifdef MPK_ENABLE_PROFILING
@@ -308,8 +306,6 @@ __device__ __forceinline__ bool
     config.request_ids[num_reqs] = next_request_id;
     if (threadIdx.x == 0) {
         config.request_start_cycles[next_request_id] = clock64();
-
-        printf("modify request_start_cycles%d\n",next_request_id);
     }
     config.qo_indptr_buffer[num_reqs] = num_tokens;
     config.paged_kv_indptr_buffer[num_reqs] = num_pages;
@@ -1130,6 +1126,9 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
       static_cast<int *>(meta_tensors[8]);
   global_runtime_config.paged_kv_last_page_len_buffer =
       static_cast<int *>(meta_tensors[9]);
+  global_runtime_config.request_start_cycles = static_cast<uint64_t*>(meta_tensors[10]);
+  global_runtime_config.first_token_cycles   = static_cast<uint64_t*>(meta_tensors[11]);
+  global_runtime_config.token_cycles         = static_cast<uint64_t*>(meta_tensors[12]);
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
   global_runtime_config.num_remote_schedulers = num_remote_schedulers;
@@ -1320,13 +1319,6 @@ extern "C" void init_persistent_kernel(std::vector<void *> meta_tensors,
                first_tasks.size() * sizeof(TaskId),
                cudaMemcpyHostToDevice);
   }
-  global_runtime_config.request_start_cycles =
-      gpu_malloc<uint64_t>(total_num_requests * sizeof(uint64_t));
-  global_runtime_config.first_token_cycles =
-      gpu_malloc<uint64_t>(total_num_requests * sizeof(uint64_t));
-  global_runtime_config.token_cycles =
-      gpu_malloc<uint64_t>(total_num_requests * MPK_MAX_SEQ_LENGTH * sizeof(uint64_t));
-
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, my_rank);
   global_runtime_config.gpu_clock_khz = prop.clockRate;

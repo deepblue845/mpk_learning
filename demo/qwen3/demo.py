@@ -860,13 +860,12 @@ if __name__ == "__main__":
         clock_rate_mhz = torch.cuda.clock_rate(device=0)
         clock_khz= clock_rate_mhz * 1000
         print(f"clock_rate={clock_khz}")
-        cycles_to_ms = 1.0 / (clock_khz * 1000.0)  
+        cycles_to_ms = 1.0 / (clock_khz )  
         for r in range(total_num_requests):
             prompt_len = prompt_lengths[r].item()
             end_pos = step[r].item()   # step 是最后生成的位置
             if end_pos >= prompt_len:
                 ttft_cycles = first_token_cpu[r] - request_start_cpu[r]
-                print(f"first_token_cpu{first_token_cpu[r]},request_start_cpu{request_start_cpu[r]}")
                 ttft_ms = ttft_cycles * cycles_to_ms
                 print(f"Request {r}: TTFT = {ttft_ms:.3f} ms")
                 
